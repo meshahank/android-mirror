@@ -1,0 +1,1 @@
+<resources><style name="Theme.AndroidMirror" parent="Theme.Material3.DayNight.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#3367D6</item></style></resources>

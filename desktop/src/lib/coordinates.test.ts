@@ -1,0 +1,2 @@
+import {describe,it,expect} from 'vitest'; import {videoPoint} from './coordinates';
+describe('videoPoint',()=>{it('maps a portrait video without offset',()=>expect(videoPoint(50,100,{left:0,top:0,width:100,height:200},100,200)).toEqual({x:.5,y:.5}));it('excludes landscape letterbox',()=>{expect(videoPoint(10,10,{left:0,top:0,width:200,height:200},200,100)).toBeNull();expect(videoPoint(100,100,{left:0,top:0,width:200,height:200},200,100)).toEqual({x:.5,y:.5})})});
