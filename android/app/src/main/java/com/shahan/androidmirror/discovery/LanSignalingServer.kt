@@ -20,16 +20,17 @@ import io.ktor.server.routing.routing
 import io.ktor.server.websocket.DefaultWebSocketServerSession
 import io.ktor.server.websocket.WebSockets
 import io.ktor.server.websocket.webSocket
-import io.ktor.websocket.CloseReason
-import io.ktor.websocket.Frame
+import io.ktor.websocket.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.decodeFromString
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.parseToJsonElement
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -86,7 +87,8 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
     fun sendSignal(signal: Signal) {
         val socket = active.get() ?: return
         scope.launch {
-            socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))))
+            val envelope = Envelope<Signal>(type = "signal", body = signal)
+            socket.send(Frame.Text(Wire.json.encodeToString(envelope)))
         }
     }
 
@@ -101,21 +103,23 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
                 ws.close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "invalid message"))
                 return@consumeEach
             }
-            val objectBody = Wire.json.parseToJsonElement(raw).jsonObject
-            val type = objectBody["type"]?.jsonPrimitive?.content ?: return@consumeEach
-            val body = objectBody["body"] ?: return@consumeEach
+            val json = Wire.json.decodeFromString<JsonObject>(raw)
+            val type = json["type"]?.jsonPrimitive?.content ?: return@consumeEach
+            val body = json["body"] ?: return@consumeEach
             when (type) {
                 "pair-request" -> {
                     val request = Wire.json.decodeFromJsonElement<PairRequest>(body)
                     val allowed = request.shortCode == shortCode && request.clientPublicKey.length in 16..8192 && callbacks.pairRequested(request.computerName.take(60), request.clientPublicKey)
                     if (allowed) paired[request.clientPublicKey] = request.computerName
-                    ws.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "pair-result", body = PairResult(allowed, deviceId, android.os.Build.MODEL, if (allowed) null else "Rejected or expired"))))
+                    val response = Envelope<PairResult>(type = "pair-result", body = PairResult(allowed, deviceId, android.os.Build.MODEL, if (allowed) null else "Rejected or expired"))
+                    ws.send(Frame.Text(Wire.json.encodeToString(response)))
                 }
                 "session-request" -> {
                     val request = Wire.json.decodeFromJsonElement<SessionRequest>(body)
                     val allowed = paired.containsKey(request.clientId) && callbacks.sessionRequested(request.clientId)
                     if (allowed) active.set(ws)
-                    ws.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "session-status", body = SessionStatus(if (allowed) "capture-starting" else "rejected"))))
+                    val response = Envelope<SessionStatus>(type = "session-status", body = SessionStatus(if (allowed) "capture-starting" else "rejected"))
+                    ws.send(Frame.Text(Wire.json.encodeToString(response)))
                 }
                 "signal" -> if (active.get() === ws) callbacks.signal(Wire.json.decodeFromJsonElement<Signal>(body))
                 "control" -> if (active.get() === ws) callbacks.control(Wire.json.decodeFromJsonElement<Control>(body))
