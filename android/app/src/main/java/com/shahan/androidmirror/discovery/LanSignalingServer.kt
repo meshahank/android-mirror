@@ -32,7 +32,7 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
     val deviceId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: Wire.id()
     fun start() { context.getSharedPreferences("mirror", Context.MODE_PRIVATE).edit().putString("pair_code", shortCode).apply(); server.start(false); nsd.registerService(NsdServiceInfo().apply { serviceName = "AndroidMirror-${android.os.Build.MODEL.take(18)}"; serviceType = SERVICE; port = PORT; setAttribute("v", "1"); setAttribute("id", deviceId.take(12)) }, NsdManager.PROTOCOL_DNS_SD, registration) }
     fun stop() { active.getAndSet(null)?.close(); runCatching { nsd.unregisterService(registration) }; server.stop(500, 1500) }
-    fun sendSignal(signal: Signal) { active.get()?.let { ws -> CoroutineScope(Dispatchers.IO).launch { ws.send(Frame.Text(Wire.json.encodeToString(Envelope("signal", body = signal))) } } }
+    fun sendSignal(signal: Signal) { active.get()?.let { ws -> CoroutineScope(Dispatchers.IO).launch { ws.send(Frame.Text(Wire.json.encodeToString(Envelope("signal", body = signal)))) } } }
     private suspend fun handle(ws: DefaultWebSocketServerSession) {
         ws.incoming.consumeEach { frame -> if (frame !is Frame.Text || !validEnvelope(frame.readText())) { ws.close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "invalid")); return@consumeEach }; val obj = Wire.json.parseToJsonElement(frame.readText()).jsonObject; val type = obj["type"]?.jsonPrimitive?.content ?: return@consumeEach; val body = obj["body"] ?: return@consumeEach
             when (type) {
