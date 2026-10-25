@@ -1,34 +1,160 @@
 package com.shahan.androidmirror.service
 
-import android.app.*
-import android.content.*
-import android.media.projection.MediaProjectionManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.media.projection.MediaProjection
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.shahan.androidmirror.R
 import com.shahan.androidmirror.accessibility.RemoteControlService
 import com.shahan.androidmirror.discovery.LanSignalingServer
-import com.shahan.androidmirror.protocol.*
-import org.webrtc.*
+import com.shahan.androidmirror.protocol.Control
+import com.shahan.androidmirror.protocol.Signal
+import org.webrtc.DataChannel
+import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
+import org.webrtc.EglBase
+import org.webrtc.IceCandidate
+import org.webrtc.MediaConstraints
+import org.webrtc.MediaStream
+import org.webrtc.PeerConnection
+import org.webrtc.PeerConnectionFactory
+import org.webrtc.RtpReceiver
+import org.webrtc.ScreenCapturerAndroid
+import org.webrtc.SdpObserver
+import org.webrtc.SessionDescription
+import org.webrtc.SurfaceTextureHelper
 import java.security.MessageDigest
 import java.util.concurrent.Executors
 
-/** Owns consent-bound capture. Stops immediately through notification or Android's projection callback. */
 class MirrorService : Service(), LanSignalingServer.Callbacks {
-    private val egl = EglBase.create(); private val executor = Executors.newSingleThreadExecutor()
-    private lateinit var server: LanSignalingServer; private var factory: PeerConnectionFactory? = null; private var peer: PeerConnection? = null; private var capturer: ScreenCapturerAndroid? = null
-    private var projectionData: Intent? = null; private var resultCode = 0
+    private val egl = EglBase.create()
+    private val executor = Executors.newSingleThreadExecutor()
+    private lateinit var server: LanSignalingServer
+    private var factory: PeerConnectionFactory? = null
+    private var peer: PeerConnection? = null
+    private var capturer: ScreenCapturerAndroid? = null
+    private var projectionData: Intent? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int { if (intent?.action == "stop") { stopSelf(); return START_NOT_STICKY }; projectionData = intent?.getParcelableExtra("data"); resultCode = intent?.getIntExtra("result", 0) ?: 0; startForeground(7, notification()); startServer(); return START_NOT_STICKY }
-    private fun startServer() { server = LanSignalingServer(this, this); server.start() }
-    private fun notification(): Notification { val channel = NotificationChannel("mirror", getString(R.string.mirror_channel), NotificationManager.IMPORTANCE_LOW); getSystemService(NotificationManager::class.java).createNotificationChannel(channel); val stop = PendingIntent.getService(this, 1, Intent(this, MirrorService::class.java).setAction("stop"), PendingIntent.FLAG_IMMUTABLE); return NotificationCompat.Builder(this, "mirror").setSmallIcon(android.R.drawable.presence_video_online).setContentTitle("Android Mirror is sharing your screen").setContentText("Tap Stop to end sharing").addAction(0, "Stop", stop).setOngoing(true).build() }
-    private fun fingerprint(key: String) = MessageDigest.getInstance("SHA-256").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        projectionData = intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
+        if (projectionData == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        startForeground(NOTIFICATION_ID, notification())
+        server = LanSignalingServer(this, this)
+        server.start()
+        return START_NOT_STICKY
+    }
+
+    private fun notification(): Notification {
+        val channel = NotificationChannel(CHANNEL_ID, getString(R.string.mirror_channel), NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val stopIntent = PendingIntent.getService(this, 1, Intent(this, MirrorService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setContentTitle("Android Mirror is sharing your screen")
+            .setContentText("Tap Stop to end sharing")
+            .addAction(0, "Stop", stopIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun fingerprint(key: String): String = MessageDigest.getInstance("SHA-256").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }
     override fun pairRequested(name: String, key: String): Boolean = getSharedPreferences("paired", MODE_PRIVATE).edit().putString(fingerprint(key), name).commit()
     override fun sessionRequested(clientId: String): Boolean = getSharedPreferences("paired", MODE_PRIVATE).contains(fingerprint(clientId))
-    override fun signal(signal: Signal) = executor.execute { if (signal.sdpType == "offer") answer(signal) else if (signal.candidate != null) peer?.addIceCandidate(IceCandidate(signal.sdpMid, signal.sdpMLineIndex ?: 0, signal.candidate)) }
-    override fun control(control: Control) { val metrics = resources.displayMetrics; if (RemoteControlService.instance == null) { server.sendSignal(Signal()); return }; RemoteControlService.instance?.execute(control, metrics.widthPixels, metrics.heightPixels) }
-    private fun answer(offer: Signal) { ensurePeer(); val p = peer ?: return; p.setRemoteDescription(observer {}, SessionDescription(SessionDescription.Type.OFFER, offer.sdp ?: return)); p.createAnswer(object : SdpObserver { override fun onCreateSuccess(s: SessionDescription) { p.setLocalDescription(observer {}, s); server.sendSignal(Signal(s.type.canonicalForm(), s.description)) }; override fun onSetSuccess(){}; override fun onCreateFailure(e:String){}; override fun onSetFailure(e:String){} }, MediaConstraints()) }
-    private fun ensurePeer() { if (peer != null || projectionData == null) return; PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions()); factory = PeerConnectionFactory.builder().setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)).setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext)).createPeerConnectionFactory(); capturer = ScreenCapturerAndroid(projectionData, object: MediaProjection.Callback(){ override fun onStop(){ stopSelf() } }); val source = factory!!.createVideoSource(true); capturer!!.initialize(SurfaceTextureHelper.create("capture", egl.eglBaseContext), this, source.capturerObserver); capturer!!.startCapture(1280, 720, 30); peer = factory!!.createPeerConnection(PeerConnection.RTCConfiguration(emptyList()), object: PeerConnection.Observer { override fun onIceCandidate(c: IceCandidate) { server.sendSignal(Signal(candidate=c.sdp, sdpMid=c.sdpMid, sdpMLineIndex=c.sdpMLineIndex)) }; override fun onConnectionChange(s: PeerConnection.PeerConnectionState){}; override fun onSignalingChange(s: PeerConnection.SignalingState){}; override fun onIceConnectionChange(s: PeerConnection.IceConnectionState){}; override fun onIceConnectionReceivingChange(b:Boolean){}; override fun onIceGatheringChange(s:PeerConnection.IceGatheringState){}; override fun onIceCandidatesRemoved(c:Array<IceCandidate>){}; override fun onAddStream(s:MediaStream){}; override fun onRemoveStream(s:MediaStream){}; override fun onDataChannel(c:DataChannel){}; override fun onRenegotiationNeeded(){}; override fun onAddTrack(r:RtpReceiver?, m:Array<out MediaStream>?){} }).also { it?.addTrack(factory!!.createVideoTrack("screen", source), listOf("mirror")) } }
-    private fun observer(done: () -> Unit) = object : SdpObserver { override fun onCreateSuccess(s: SessionDescription){}; override fun onSetSuccess(){ done() }; override fun onCreateFailure(e:String){}; override fun onSetFailure(e:String){} }
-    override fun onDestroy() { runCatching { capturer?.stopCapture() }; capturer?.dispose(); peer?.dispose(); factory?.dispose(); egl.release(); if (::server.isInitialized) server.stop(); executor.shutdownNow(); super.onDestroy() }
+
+    override fun signal(signal: Signal) {
+        executor.execute {
+            if (signal.sdpType == "offer") answer(signal)
+            else if (signal.candidate != null) peer?.addIceCandidate(IceCandidate(signal.sdpMid, signal.sdpMLineIndex ?: 0, signal.candidate))
+        }
+    }
+
+    override fun control(control: Control) {
+        val metrics = resources.displayMetrics
+        RemoteControlService.instance?.execute(control, metrics.widthPixels, metrics.heightPixels)
+    }
+
+    private fun answer(offer: Signal) {
+        ensurePeer()
+        val connection = peer ?: return
+        val description = offer.sdp ?: return
+        connection.setRemoteDescription(sdpObserver {}, SessionDescription(SessionDescription.Type.OFFER, description))
+        connection.createAnswer(object : SdpObserver {
+            override fun onCreateSuccess(answer: SessionDescription) {
+                connection.setLocalDescription(sdpObserver {}, answer)
+                server.sendSignal(Signal(sdpType = answer.type.canonicalForm(), sdp = answer.description))
+            }
+            override fun onSetSuccess() = Unit
+            override fun onCreateFailure(error: String) = Unit
+            override fun onSetFailure(error: String) = Unit
+        }, MediaConstraints())
+    }
+
+    private fun ensurePeer() {
+        if (peer != null) return
+        val data = projectionData ?: return
+        PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions())
+        factory = PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
+            .createPeerConnectionFactory()
+        capturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
+        })
+        val source = factory!!.createVideoSource(true)
+        capturer!!.initialize(SurfaceTextureHelper.create("capture", egl.eglBaseContext), this, source.capturerObserver)
+        capturer!!.startCapture(1280, 720, 30)
+        peer = factory!!.createPeerConnection(PeerConnection.RTCConfiguration(emptyList()), object : PeerConnection.Observer {
+            override fun onIceCandidate(candidate: IceCandidate) { server.sendSignal(Signal(candidate = candidate.sdp, sdpMid = candidate.sdpMid, sdpMLineIndex = candidate.sdpMLineIndex)) }
+            override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
+            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) = Unit
+            override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
+            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) = Unit
+            override fun onIceCandidatesRemoved(candidates: Array<IceCandidate>) = Unit
+            override fun onAddStream(stream: MediaStream) = Unit
+            override fun onRemoveStream(stream: MediaStream) = Unit
+            override fun onDataChannel(channel: DataChannel) = Unit
+            override fun onRenegotiationNeeded() = Unit
+            override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<MediaStream>) = Unit
+        })
+        peer?.addTrack(factory!!.createVideoTrack("screen", source), listOf("mirror"))
+    }
+
+    private fun sdpObserver(onSet: () -> Unit) = object : SdpObserver {
+        override fun onCreateSuccess(description: SessionDescription) = Unit
+        override fun onSetSuccess() = onSet()
+        override fun onCreateFailure(error: String) = Unit
+        override fun onSetFailure(error: String) = Unit
+    }
+
+    override fun onDestroy() {
+        runCatching { capturer?.stopCapture() }
+        capturer?.dispose()
+        peer?.dispose()
+        factory?.dispose()
+        egl.release()
+        if (::server.isInitialized) server.stop()
+        executor.shutdownNow()
+        super.onDestroy()
+    }
+
+    companion object {
+        const val ACTION_STOP = "stop"
+        const val EXTRA_PROJECTION_DATA = "data"
+        private const val CHANNEL_ID = "mirror"
+        private const val NOTIFICATION_ID = 7
+    }
 }
