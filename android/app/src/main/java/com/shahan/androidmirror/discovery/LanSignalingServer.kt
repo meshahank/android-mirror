@@ -12,6 +12,7 @@ import io.ktor.server.websocket.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.consumeEach
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
