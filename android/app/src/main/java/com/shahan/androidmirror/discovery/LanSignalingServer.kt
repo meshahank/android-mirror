@@ -58,9 +58,7 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
 
     fun stop() {
         active.getAndSet(null)?.let { socket ->
-            scope.launch {
-                try { socket.close() } catch (_: Exception) {}
-            }
+            scope.launch { try { socket.close() } catch (_: Throwable) {} }
         }
         runCatching { nsd.unregisterService(registration) }
         server.stop(500, 1500)
@@ -71,7 +69,14 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
         scope.launch {
             try {
                 socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))))
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
+        }
+    }
+
+    fun sendStatus(state: String, message: String) {
+        val socket = active.get() ?: return
+        scope.launch {
+            try { status(socket, state, message) } catch (_: Throwable) {}
         }
     }
 
@@ -92,7 +97,7 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
                             val request = Wire.json.decodeFromJsonElement<PairRequest>(body)
                             val accepted = request.shortCode == shortCode && callbacks.pairRequested(request.computerName.take(60), request.clientPublicKey)
                             if (accepted) paired[request.clientPublicKey] = request.computerName
-                            val result = Envelope(type = "pair-result", body = PairResult(accepted, deviceId, android.os.Build.MODEL, if (accepted) null else "The code was rejected"))
+                            val result = Envelope(type = "pair-result", body = PairResult(accepted, deviceId, android.os.Build.MODEL ?: "Android", if (accepted) null else "The code was rejected"))
                             ws.send(Frame.Text(Wire.json.encodeToString(result)))
                         }
                         "session-request" -> {
@@ -105,10 +110,12 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
                         "signal" -> if (active.get() === ws) callbacks.signal(Wire.json.decodeFromJsonElement<Signal>(body))
                         "control" -> if (active.get() === ws) callbacks.control(Wire.json.decodeFromJsonElement<Control>(body))
                     }
-                } catch (error: Exception) {
-                    status(ws, "error", error.message ?: "Phone could not process the connection message")
+                } catch (error: Throwable) {
+                    try { status(ws, "error", error.message ?: error.javaClass.simpleName) } catch (_: Throwable) {}
                 }
             }
+        } catch (error: Throwable) {
+            try { status(ws, "error", error.message ?: error.javaClass.simpleName) } catch (_: Throwable) {}
         } finally {
             active.compareAndSet(ws, null)
         }
