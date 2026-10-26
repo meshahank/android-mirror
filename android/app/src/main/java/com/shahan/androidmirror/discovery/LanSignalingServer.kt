@@ -1,10 +1,10 @@
 package com.shahan.androidmirror.discovery
 
 import android.content.Context
-import io.ktor.server.application.*
 import android.net.nsd.*
 import android.provider.Settings
 import com.shahan.androidmirror.protocol.*
+import io.ktor.server.application.*
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.routing.routing
@@ -56,14 +56,22 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
     }
 
     fun stop() {
-        active.getAndSet(null)?.let { socket -> scope.launch { runCatching { socket.close() } } }
+        active.getAndSet(null)?.let { socket ->
+            scope.launch {
+                try { socket.close() } catch (_: Exception) {}
+            }
+        }
         runCatching { nsd.unregisterService(registration) }
         server.stop(500, 1500)
     }
 
     fun sendSignal(signal: Signal) {
         val socket = active.get() ?: return
-        scope.launch { runCatching { socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))) } }
+        scope.launch {
+            try {
+                socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))))
+            } catch (_: Exception) {}
+        }
     }
 
     private suspend fun status(ws: DefaultWebSocketServerSession, state: String, message: String? = null) {
