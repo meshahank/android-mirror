@@ -32,7 +32,7 @@ class LanSignalingServer(private val context:Context,private val callbacks:Callb
   override fun onServiceUnregistered(info:NsdServiceInfo)=Unit
   override fun onUnregistrationFailed(info:NsdServiceInfo,error:Int)=Unit
  }
- val shortCode=(100000+SecureRandom().nextInt(900000)).toString()
+ val shortCode=context.getSharedPreferences("mirror",Context.MODE_PRIVATE).getString("pair_code",null) ?: (100000+SecureRandom().nextInt(900000)).toString()
  val deviceId=Settings.Secure.getString(context.contentResolver,Settings.Secure.ANDROID_ID)?:Wire.id()
  fun start() { server.start(false); nsd.registerService(NsdServiceInfo().apply { serviceName="AndroidMirror"; serviceType=SERVICE; port=PORT; setAttribute("id",deviceId.take(12)) },NsdManager.PROTOCOL_DNS_SD,registration) }
  fun stop() { active.getAndSet(null)?.let { socket->scope.launch { socket.close() } }; runCatching { nsd.unregisterService(registration) }; server.stop(500,1500) }
