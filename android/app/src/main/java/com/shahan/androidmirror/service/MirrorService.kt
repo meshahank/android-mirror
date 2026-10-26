@@ -43,15 +43,9 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
         projectionData = intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
-        if (projectionData == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        if (projectionData == null) { stopSelf(); return START_NOT_STICKY }
         startForeground(NOTIFICATION_ID, notification())
         server = LanSignalingServer(this, this)
         server.start()
@@ -66,9 +60,7 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentTitle("Android Mirror is sharing your screen")
             .setContentText("Tap Stop to end sharing")
-            .addAction(0, "Stop", stopIntent)
-            .setOngoing(true)
-            .build()
+            .addAction(0, "Stop", stopIntent).setOngoing(true).build()
     }
 
     private fun fingerprint(key: String): String = MessageDigest.getInstance("SHA-256").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }
@@ -77,8 +69,12 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
 
     override fun signal(signal: Signal) {
         executor.execute {
-            if (signal.sdpType == "offer") answer(signal)
-            else if (signal.candidate != null) peer?.addIceCandidate(IceCandidate(signal.sdpMid, signal.sdpMLineIndex ?: 0, signal.candidate))
+            try {
+                if (signal.sdpType == "offer") answer(signal)
+                else if (signal.candidate != null) peer?.addIceCandidate(IceCandidate(signal.sdpMid, signal.sdpMLineIndex ?: 0, signal.candidate))
+            } catch (error: Throwable) {
+                report("Screen capture setup failed: ${error.message ?: error.javaClass.simpleName}")
+            }
         }
     }
 
@@ -87,33 +83,42 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
         RemoteControlService.instance?.execute(control, metrics.widthPixels, metrics.heightPixels)
     }
 
+    private fun report(message: String) { if (::server.isInitialized) server.sendStatus("error", message) }
+
     private fun answer(offer: Signal) {
         ensurePeer()
-        val connection = peer ?: return
-        val description = offer.sdp ?: return
-        connection.setRemoteDescription(sdpObserver {}, SessionDescription(SessionDescription.Type.OFFER, description))
+        val connection = peer ?: run { report("Could not create the video connection"); return }
+        val description = offer.sdp ?: run { report("Desktop sent an empty video offer"); return }
+        connection.setRemoteDescription(object : SdpObserver {
+            override fun onSetSuccess() { createAnswer(connection) }
+            override fun onSetFailure(error: String) { report("Desktop offer rejected: $error") }
+            override fun onCreateSuccess(description: SessionDescription) = Unit
+            override fun onCreateFailure(error: String) = Unit
+        }, SessionDescription(SessionDescription.Type.OFFER, description))
+    }
+
+    private fun createAnswer(connection: PeerConnection) {
         connection.createAnswer(object : SdpObserver {
             override fun onCreateSuccess(answer: SessionDescription) {
-                connection.setLocalDescription(sdpObserver {}, answer)
-                server.sendSignal(Signal(sdpType = answer.type.canonicalForm(), sdp = answer.description))
+                connection.setLocalDescription(object : SdpObserver {
+                    override fun onSetSuccess() { server.sendSignal(Signal(sdpType = answer.type.canonicalForm(), sdp = answer.description)) }
+                    override fun onSetFailure(error: String) { report("Could not apply video answer: $error") }
+                    override fun onCreateSuccess(description: SessionDescription) = Unit
+                    override fun onCreateFailure(error: String) = Unit
+                }, answer)
             }
+            override fun onCreateFailure(error: String) { report("Could not create video answer: $error") }
             override fun onSetSuccess() = Unit
-            override fun onCreateFailure(error: String) = Unit
             override fun onSetFailure(error: String) = Unit
         }, MediaConstraints())
     }
 
     private fun ensurePeer() {
         if (peer != null) return
-        val data = projectionData ?: return
+        val data = projectionData ?: throw IllegalStateException("Screen-share permission is missing")
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions())
-        factory = PeerConnectionFactory.builder()
-            .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
-            .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
-            .createPeerConnectionFactory()
-        capturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
-            override fun onStop() { stopSelf() }
-        })
+        factory = PeerConnectionFactory.builder().setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)).setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext)).createPeerConnectionFactory()
+        capturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() { override fun onStop() { stopSelf() } })
         val source = factory!!.createVideoSource(true)
         capturer!!.initialize(SurfaceTextureHelper.create("capture", egl.eglBaseContext), this, source.capturerObserver)
         capturer!!.startCapture(1280, 720, 30)
@@ -133,22 +138,11 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
         peer?.addTrack(factory!!.createVideoTrack("screen", source), listOf("mirror"))
     }
 
-    private fun sdpObserver(onSet: () -> Unit) = object : SdpObserver {
-        override fun onCreateSuccess(description: SessionDescription) = Unit
-        override fun onSetSuccess() = onSet()
-        override fun onCreateFailure(error: String) = Unit
-        override fun onSetFailure(error: String) = Unit
-    }
-
     override fun onDestroy() {
         runCatching { capturer?.stopCapture() }
-        capturer?.dispose()
-        peer?.dispose()
-        factory?.dispose()
-        egl.release()
+        capturer?.dispose(); peer?.dispose(); factory?.dispose(); egl.release()
         if (::server.isInitialized) server.stop()
-        executor.shutdownNow()
-        super.onDestroy()
+        executor.shutdownNow(); super.onDestroy()
     }
 
     companion object {
