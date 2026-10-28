@@ -1,8 +1,13 @@
 name: Build Android Mirror
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
+
+permissions:
+  contents: write
+
 jobs:
   android:
     runs-on: ubuntu-latest
@@ -16,7 +21,10 @@ jobs:
         working-directory: android
         run: /tmp/gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
-        with: { name: Android-Mirror-APK, path: android/app/build/outputs/apk/debug/app-debug.apk }
+        with:
+          name: Android-Mirror-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
   windows:
     runs-on: windows-latest
     steps:
@@ -31,4 +39,33 @@ jobs:
         working-directory: desktop
         run: npm run tauri build
       - uses: actions/upload-artifact@v4
-        with: { name: Android-Mirror-Windows, path: desktop/src-tauri/target/release/bundle/** }
+        with:
+          name: Android-Mirror-Windows
+          path: desktop/src-tauri/target/release/bundle/**
+
+  release:
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Prepare direct downloads
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "$(find dist/Android-Mirror-APK -type f -name '*.apk' -print -quit)" release/Android-Mirror.apk
+          cp "$(find dist/Android-Mirror-Windows -type f -iname '*.exe' -print -quit)" release/Android-Mirror-Setup.exe
+      - name: Publish direct test downloads
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-test
+          name: Latest test build
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          files: |
+            release/Android-Mirror.apk
+            release/Android-Mirror-Setup.exe
+          fail_on_unmatched_files: true
+          overwrite_files: true
