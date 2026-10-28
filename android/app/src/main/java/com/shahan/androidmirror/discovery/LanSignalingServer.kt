@@ -1,19 +1,35 @@
 package com.shahan.androidmirror.discovery
 
 import android.content.Context
-import android.net.nsd.*
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.provider.Settings
-import com.shahan.androidmirror.protocol.*
-import io.ktor.server.application.*
+import com.shahan.androidmirror.protocol.Control
+import com.shahan.androidmirror.protocol.Envelope
+import com.shahan.androidmirror.protocol.PairRequest
+import com.shahan.androidmirror.protocol.PairResult
+import com.shahan.androidmirror.protocol.SessionRequest
+import com.shahan.androidmirror.protocol.SessionStatus
+import com.shahan.androidmirror.protocol.Signal
+import com.shahan.androidmirror.protocol.Wire
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.routing.routing
-import io.ktor.server.websocket.*
-import io.ktor.websocket.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.consumeEach
+import io.ktor.server.websocket.WebSockets
+import io.ktor.server.websocket.webSocket
+import io.ktor.websocket.DefaultWebSocketServerSession
+import io.ktor.websocket.Frame
+import io.ktor.websocket.close
+import io.ktor.websocket.readText
+import io.ktor.websocket.send
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.*
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -42,8 +58,8 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
         override fun onUnregistrationFailed(info: NsdServiceInfo, error: Int) = Unit
     }
 
-    val shortCode = context.getSharedPreferences("mirror", Context.MODE_PRIVATE)
-        .getString("pair_code", null) ?: (100000 + SecureRandom().nextInt(900000)).toString()
+    val shortCode = context.getSharedPreferences("mirror", Context.MODE_PRIVATE).getString("pair_code", null)
+        ?: (100000 + SecureRandom().nextInt(900000)).toString()
     val deviceId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: Wire.id()
 
     fun start() {
@@ -57,65 +73,69 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
     }
 
     fun stop() {
-        active.getAndSet(null)?.let { socket ->
-            scope.launch { try { socket.close() } catch (_: Throwable) {} }
-        }
+        active.getAndSet(null)?.let { socket -> scope.launch { try { socket.close() } catch (_: Throwable) {} } }
         runCatching { nsd.unregisterService(registration) }
         server.stop(500, 1500)
     }
 
     fun sendSignal(signal: Signal) {
-        val socket = active.get() ?: return
-        scope.launch {
-            try {
-                socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))))
-            } catch (_: Throwable) {}
-        }
+        active.get()?.let { socket -> scope.launch { runCatching { socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))) } } }
     }
 
     fun sendStatus(state: String, message: String) {
-        val socket = active.get() ?: return
-        scope.launch {
-            try { status(socket, state, message) } catch (_: Throwable) {}
-        }
+        active.get()?.let { socket -> scope.launch { runCatching { sendStatus(socket, state, message) } } }
     }
 
-    private suspend fun status(ws: DefaultWebSocketServerSession, state: String, message: String? = null) {
+    private fun setStage(stage: String) {
+        context.getSharedPreferences("mirror", Context.MODE_PRIVATE).edit().putString("session_stage", stage).apply()
+    }
+
+    private suspend fun sendStatus(ws: DefaultWebSocketServerSession, state: String, message: String) {
         ws.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "session-status", body = SessionStatus(state, message)))))
     }
 
     private suspend fun handle(ws: DefaultWebSocketServerSession) {
+        setStage("Desktop connected: waiting for pairing request")
         try {
-            ws.incoming.consumeEach { frame ->
-                if (frame !is Frame.Text) return@consumeEach
+            for (frame in ws.incoming) {
+                if (frame !is Frame.Text) continue
                 try {
                     val root = Wire.json.decodeFromString<JsonObject>(frame.readText())
-                    val type = root["type"]?.jsonPrimitive?.content ?: return@consumeEach
-                    val body = root["body"] ?: return@consumeEach
+                    val type = root["type"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Message had no type")
+                    val body = root["body"]?.jsonObject ?: throw IllegalArgumentException("Message had no body")
                     when (type) {
                         "pair-request" -> {
                             val request = Wire.json.decodeFromJsonElement<PairRequest>(body)
+                            setStage("Pair code received: checking it")
                             val accepted = request.shortCode == shortCode && callbacks.pairRequested(request.computerName.take(60), request.clientPublicKey)
                             if (accepted) paired[request.clientPublicKey] = request.computerName
-                            val result = Envelope(type = "pair-result", body = PairResult(accepted, deviceId, android.os.Build.MODEL ?: "Android", if (accepted) null else "The code was rejected"))
-                            ws.send(Frame.Text(Wire.json.encodeToString(result)))
+                            ws.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "pair-result", body = PairResult(accepted, deviceId, android.os.Build.MODEL, if (accepted) null else "The code was rejected")))))
+                            setStage(if (accepted) "Pairing approved: waiting for desktop session" else "Pairing rejected: check the 6-digit code")
                         }
                         "session-request" -> {
                             val request = Wire.json.decodeFromJsonElement<SessionRequest>(body)
                             val accepted = paired.containsKey(request.clientId) && callbacks.sessionRequested(request.clientId)
-                            if (!accepted) { status(ws, "rejected", "This computer is not paired"); return@consumeEach }
+                            if (!accepted) {
+                                setStage("Session rejected: this desktop is not paired")
+                                sendStatus(ws, "rejected", "This computer is not paired")
+                                continue
+                            }
                             active.set(ws)
-                            status(ws, "capture-starting", "Pairing approved. Starting screen capture.")
+                            setStage("Desktop session approved: starting screen capture")
+                            sendStatus(ws, "capture-starting", "Pairing approved. Starting screen capture.")
                         }
                         "signal" -> if (active.get() === ws) callbacks.signal(Wire.json.decodeFromJsonElement<Signal>(body))
                         "control" -> if (active.get() === ws) callbacks.control(Wire.json.decodeFromJsonElement<Control>(body))
+                        else -> throw IllegalArgumentException("Unknown message type: $type")
                     }
                 } catch (error: Throwable) {
-                    try { status(ws, "error", error.message ?: error.javaClass.simpleName) } catch (_: Throwable) {}
+                    val message = error.message ?: error.javaClass.simpleName
+                    setStage("ERROR receiving desktop request: $message")
+                    runCatching { sendStatus(ws, "error", message) }
                 }
             }
         } catch (error: Throwable) {
-            try { status(ws, "error", error.message ?: error.javaClass.simpleName) } catch (_: Throwable) {}
+            setStage("Desktop connection closed: ${error.message ?: error.javaClass.simpleName}")
         } finally {
             active.compareAndSet(ws, null)
         }
