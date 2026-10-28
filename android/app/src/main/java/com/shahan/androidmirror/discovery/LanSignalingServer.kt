@@ -1,35 +1,19 @@
 package com.shahan.androidmirror.discovery
 
 import android.content.Context
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.net.nsd.*
 import android.provider.Settings
-import com.shahan.androidmirror.protocol.Control
-import com.shahan.androidmirror.protocol.Envelope
-import com.shahan.androidmirror.protocol.PairRequest
-import com.shahan.androidmirror.protocol.PairResult
-import com.shahan.androidmirror.protocol.SessionRequest
-import com.shahan.androidmirror.protocol.SessionStatus
-import com.shahan.androidmirror.protocol.Signal
-import com.shahan.androidmirror.protocol.Wire
+import com.shahan.androidmirror.protocol.*
+import io.ktor.server.application.*
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.routing.routing
-import io.ktor.server.websocket.WebSockets
-import io.ktor.server.websocket.webSocket
-import io.ktor.websocket.DefaultWebSocketServerSession
-import io.ktor.websocket.Frame
-import io.ktor.websocket.close
-import io.ktor.websocket.readText
-import io.ktor.websocket.send
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import io.ktor.server.websocket.*
+import io.ktor.websocket.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.consumeEach
 import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.*
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -97,8 +81,8 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
     private suspend fun handle(ws: DefaultWebSocketServerSession) {
         setStage("Desktop connected: waiting for pairing request")
         try {
-            for (frame in ws.incoming) {
-                if (frame !is Frame.Text) continue
+            ws.incoming.consumeEach { frame ->
+                if (frame !is Frame.Text) return@consumeEach
                 try {
                     val root = Wire.json.decodeFromString<JsonObject>(frame.readText())
                     val type = root["type"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Message had no type")
@@ -118,7 +102,7 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
                             if (!accepted) {
                                 setStage("Session rejected: this desktop is not paired")
                                 sendStatus(ws, "rejected", "This computer is not paired")
-                                continue
+                                return@consumeEach
                             }
                             active.set(ws)
                             setStage("Desktop session approved: starting screen capture")
