@@ -63,7 +63,7 @@ class LanSignalingServer(private val context: Context, private val callbacks: Ca
     }
 
     fun sendSignal(signal: Signal) {
-        active.get()?.let { socket -> scope.launch { runCatching { socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal))) } } }
+        active.get()?.let { socket -> scope.launch { runCatching { socket.send(Frame.Text(Wire.json.encodeToString(Envelope(type = "signal", body = signal)))) } } }
     }
 
     fun sendStatus(state: String, message: String) {
