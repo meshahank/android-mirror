@@ -7,7 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.media.projection.MediaProjection
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import com.shahan.androidmirror.R
 import com.shahan.androidmirror.accessibility.RemoteControlService
@@ -34,6 +36,7 @@ import java.util.concurrent.Executors
 class MirrorService : Service(), LanSignalingServer.Callbacks {
     private val egl = EglBase.create()
     private val executor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var server: LanSignalingServer
     private var factory: PeerConnectionFactory? = null
     private var peer: PeerConnection? = null
@@ -43,9 +46,18 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
+        if (intent?.action == ACTION_STOP) {
+            setStage("Sharing stopped on this phone")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         projectionData = intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
-        if (projectionData == null) { stopSelf(); return START_NOT_STICKY }
+        if (projectionData == null) {
+            setStage("ERROR: Android did not provide screen-share permission")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        setStage("Ready: waiting for the desktop to connect")
         startForeground(NOTIFICATION_ID, notification())
         server = LanSignalingServer(this, this)
         server.start()
@@ -63,6 +75,10 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
             .addAction(0, "Stop", stopIntent).setOngoing(true).build()
     }
 
+    private fun setStage(value: String) {
+        getSharedPreferences("mirror", MODE_PRIVATE).edit().putString("session_stage", value).apply()
+    }
+
     private fun fingerprint(key: String): String = MessageDigest.getInstance("SHA-256").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }
     override fun pairRequested(name: String, key: String): Boolean = getSharedPreferences("paired", MODE_PRIVATE).edit().putString(fingerprint(key), name).commit()
     override fun sessionRequested(clientId: String): Boolean = getSharedPreferences("paired", MODE_PRIVATE).contains(fingerprint(clientId))
@@ -70,8 +86,12 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
     override fun signal(signal: Signal) {
         executor.execute {
             try {
-                if (signal.sdpType == "offer") answer(signal)
-                else if (signal.candidate != null) peer?.addIceCandidate(IceCandidate(signal.sdpMid, signal.sdpMLineIndex ?: 0, signal.candidate))
+                if (signal.sdpType == "offer") {
+                    setStage("Desktop offer received: starting video capture")
+                    answer(signal)
+                } else if (signal.candidate != null) {
+                    peer?.addIceCandidate(IceCandidate(signal.sdpMid, signal.sdpMLineIndex ?: 0, signal.candidate))
+                }
             } catch (error: Throwable) {
                 report("Screen capture setup failed: ${error.message ?: error.javaClass.simpleName}")
             }
@@ -83,12 +103,16 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
         RemoteControlService.instance?.execute(control, metrics.widthPixels, metrics.heightPixels)
     }
 
-    private fun report(message: String) { if (::server.isInitialized) server.sendStatus("error", message) }
+    private fun report(message: String) {
+        setStage("ERROR: $message")
+        if (::server.isInitialized) server.sendStatus("error", message)
+    }
 
     private fun answer(offer: Signal) {
         ensurePeer()
         val connection = peer ?: run { report("Could not create the video connection"); return }
         val description = offer.sdp ?: run { report("Desktop sent an empty video offer"); return }
+        setStage("Video capture started: negotiating with desktop")
         connection.setRemoteDescription(object : SdpObserver {
             override fun onSetSuccess() { createAnswer(connection) }
             override fun onSetFailure(error: String) { report("Desktop offer rejected: $error") }
@@ -101,7 +125,10 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
         connection.createAnswer(object : SdpObserver {
             override fun onCreateSuccess(answer: SessionDescription) {
                 connection.setLocalDescription(object : SdpObserver {
-                    override fun onSetSuccess() { server.sendSignal(Signal(sdpType = answer.type.canonicalForm(), sdp = answer.description)) }
+                    override fun onSetSuccess() {
+                        setStage("Answer sent: connecting video")
+                        server.sendSignal(Signal(sdpType = answer.type.canonicalForm(), sdp = answer.description))
+                    }
                     override fun onSetFailure(error: String) { report("Could not apply video answer: $error") }
                     override fun onCreateSuccess(description: SessionDescription) = Unit
                     override fun onCreateFailure(error: String) = Unit
@@ -116,9 +143,15 @@ class MirrorService : Service(), LanSignalingServer.Callbacks {
     private fun ensurePeer() {
         if (peer != null) return
         val data = projectionData ?: throw IllegalStateException("Screen-share permission is missing")
+        setStage("Creating Android video engine")
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions())
         factory = PeerConnectionFactory.builder().setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)).setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext)).createPeerConnectionFactory()
-        capturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() { override fun onStop() { stopSelf() } })
+        capturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
+            override fun onStop() {
+                report("Android ended the screen-capture permission")
+                mainHandler.postDelayed({ stopSelf() }, 500)
+            }
+        })
         val source = factory!!.createVideoSource(true)
         capturer!!.initialize(SurfaceTextureHelper.create("capture", egl.eglBaseContext), this, source.capturerObserver)
         capturer!!.startCapture(1280, 720, 30)
